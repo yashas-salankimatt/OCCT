@@ -16,7 +16,7 @@ find_package(OpenCASCADE REQUIRED)
 
 add_executable(solidcraft-occt-provider src/main.cpp src/json.cpp)
 target_include_directories(solidcraft-occt-provider PRIVATE ${OpenCASCADE_INCLUDE_DIR})
-target_link_libraries(solidcraft-occt-provider PRIVATE TKernel TKMath TKG3d TKBRep TKGeomBase TKTopAlgo TKPrim TKBO TKShHealing TKXSBase TKDESTEP)
+target_link_libraries(solidcraft-occt-provider PRIVATE TKernel TKMath TKG3d TKBRep TKGeomBase TKTopAlgo TKPrim TKBO TKFillet TKShHealing TKXSBase TKDESTEP)
 
 # Find OCCT's shared libraries where they were installed, without setting a library path.
 set_target_properties(solidcraft-occt-provider PROPERTIES BUILD_RPATH "${OpenCASCADE_LIBRARY_DIR}" INSTALL_RPATH "${OpenCASCADE_LIBRARY_DIR}")

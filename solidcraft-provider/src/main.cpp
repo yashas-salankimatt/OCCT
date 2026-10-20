@@ -1,14 +1,18 @@
 // solidcraft-occt-provider: a geometry provider for SolidCraft, backed by Open CASCADE
 // Technology. SolidCraft runs it as a separate program when its own kernel cannot do a Boolean
-// (SolidCraft's docs/geometry-providers.md). It speaks solidcraft-geometry-provider/1: it reads
-// one JSON request line from standard input, writes one JSON reply line to standard output and
-// exits.
+// or fillet (SolidCraft's docs/geometry-providers.md). It speaks solidcraft-geometry-provider/1:
+// it reads one JSON request line from standard input, writes one JSON reply line to standard
+// output and exits.
 //
 //   {"protocol", "op": "hello"}
-//     -> {"ok": true, "provider": "occt", "version": "8.0.1", "operations": ["boolean"]}
+//     -> {"ok": true, "provider": "occt", "version": "8.0.1", "operations": ["boolean", "fillet", "chamfer"]}
 //   {"protocol", "op": "boolean", "kind": "union" | "cut" | "intersect",
 //    "operands": [STEP, STEP], "tolerance_mm": t}
+//   {"protocol", "op": "fillet", "radius": r, "edges": [[x, y, z], ...], "operands": [STEP], "tolerance_mm": t}
+//   {"protocol", "op": "chamfer", "distance": d, "edges": [[x, y, z], ...], "operands": [STEP], "tolerance_mm": t}
 //     -> {"ok": true, "step": STEP}  or  {"ok": false, "error": "..."}
+//
+// A fillet or chamfer blends the operand's edges nearest each point (a point on each edge).
 //
 // Operands and results are STEP text in millimetres. Anything the libraries print goes to
 // standard error: standard output carries only the reply.
@@ -23,7 +27,11 @@
 #include <BRepAlgoAPI_Cut.hxx>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <BRepBndLib.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepCheck_Analyzer.hxx>
+#include <BRepExtrema_DistShapeShape.hxx>
+#include <BRepFilletAPI_MakeChamfer.hxx>
+#include <BRepFilletAPI_MakeFillet.hxx>
 #include <BRepGProp.hxx>
 #include <BRepPrimAPI_MakeBox.hxx>
 #include <BRep_Builder.hxx>
@@ -36,10 +44,16 @@
 #include <ShapeFix_Shape.hxx>
 #include <Standard_Failure.hxx>
 #include <Standard_Version.hxx>
+#include <BRep_Tool.hxx>
+#include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <NCollection_IndexedMap.hxx>
+#include <TopTools_ShapeMapHasher.hxx>
 #include <NCollection_List.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Compound.hxx>
+#include <TopoDS_Edge.hxx>
+#include <TopoDS_Vertex.hxx>
 #include <TopoDS_Shape.hxx>
 #include <gp_Pnt.hxx>
 
@@ -50,6 +64,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #ifdef _WIN32
   #include <io.h>
@@ -227,6 +242,108 @@ std::string boolean(const json::Value& request)
   throw Failure(why);
 }
 
+//! `shape`'s solids, valid (fixed when they are not) and with volume, or a failure naming `what`.
+TopoDS_Shape valid_solids(const TopoDS_Shape& shape, const std::string& what)
+{
+  int          n      = 0;
+  TopoDS_Shape solids = solids_of(shape, &n);
+  if (n == 0)
+    throw Failure("the " + what + " left no solid");
+  if (!BRepCheck_Analyzer(solids).IsValid())
+  {
+    Handle(ShapeFix_Shape) fix = new ShapeFix_Shape(solids);
+    fix->Perform();
+    solids = solids_of(fix->Shape(), &n);
+    if (n == 0 || !BRepCheck_Analyzer(solids).IsValid())
+      throw Failure("the " + what + "'s result is not a valid solid, even after fixing");
+  }
+  if (!(volume_of(solids) > 0.0))
+    throw Failure("the " + what + "'s result has no volume");
+  return solids;
+}
+
+//! Most edges one blend may name.
+constexpr size_t MaxEdges = 1000;
+
+//! The edges of `shape` nearest each point of `points` ([x, y, z] each), each within `within`.
+std::vector<TopoDS_Edge> edges_at(const TopoDS_Shape& shape, const json::Value& points, double within)
+{
+  if (points.kind != json::Value::Kind::Array || points.items.empty() || points.items.size() > MaxEdges)
+    throw Failure("a blend names 1 to 1000 edges, each by a point on it");
+  NCollection_IndexedMap<TopoDS_Shape, TopTools_ShapeMapHasher> all;
+  TopExp::MapShapes(shape, TopAbs_EDGE, all);
+  std::vector<TopoDS_Edge> out;
+  for (size_t n = 0; n < points.items.size(); ++n)
+  {
+    const json::Value& p = points.items[n];
+    if (p.kind != json::Value::Kind::Array || p.items.size() != 3)
+      throw Failure("each edge is a point [x, y, z]");
+    const gp_Pnt at(p.items[0].num(NAN), p.items[1].num(NAN), p.items[2].num(NAN));
+    if (!std::isfinite(at.X()) || !std::isfinite(at.Y()) || !std::isfinite(at.Z()))
+      throw Failure("an edge's point is not a finite position");
+    const TopoDS_Vertex vertex = BRepBuilderAPI_MakeVertex(at);
+    int                 best   = 0;
+    double              nearest = within;
+    for (int i = 1; i <= all.Extent(); ++i)
+    {
+      const TopoDS_Edge& edge = TopoDS::Edge(all(i));
+      if (BRep_Tool::Degenerated(edge))
+        continue;
+      BRepExtrema_DistShapeShape distance(vertex, edge);
+      if (distance.IsDone() && distance.Value() <= nearest)
+      {
+        nearest = distance.Value();
+        best    = i;
+      }
+    }
+    if (best == 0)
+      throw Failure("no edge at the blend's point " + std::to_string(n + 1));
+    const TopoDS_Edge& edge = TopoDS::Edge(all(best));
+    bool               seen = false;
+    for (const TopoDS_Edge& e : out)
+      seen = seen || e.IsSame(edge);
+    if (!seen)
+      out.push_back(edge);
+  }
+  return out;
+}
+
+//! A constant-radius fillet (`fillet`) or an equal-distance chamfer of the operand's edges.
+std::string blend(const json::Value& request, bool fillet)
+{
+  const std::string  what     = fillet ? "fillet" : "chamfer";
+  const json::Value& operands = request["operands"];
+  if (operands.kind != json::Value::Kind::Array || operands.items.size() != 1)
+    throw Failure("a " + what + " takes one operand");
+  const TopoDS_Shape body = read_step(operands.items[0].str(), "body");
+  const double       size = request[fillet ? "radius" : "distance"].num(-1.0);
+  if (!(size > 0.0) || !std::isfinite(size))
+    throw Failure("the " + what + "'s " + (fillet ? "radius" : "distance") + " must be a positive length");
+  const std::vector<TopoDS_Edge> edges = edges_at(body, request["edges"], size_of(body, body) * 0.05 + 1e-3);
+  TopoDS_Shape                   result;
+  if (fillet)
+  {
+    BRepFilletAPI_MakeFillet make(body);
+    for (const TopoDS_Edge& e : edges)
+      make.Add(size, e);
+    make.Build();
+    if (!make.IsDone())
+      throw Failure("the fillet failed (" + std::to_string(make.NbFaultyContours()) + " contour(s) could not be built)");
+    result = make.Shape();
+  }
+  else
+  {
+    BRepFilletAPI_MakeChamfer make(body);
+    for (const TopoDS_Edge& e : edges)
+      make.Add(size, e);
+    make.Build();
+    if (!make.IsDone())
+      throw Failure("the chamfer failed");
+    result = make.Shape();
+  }
+  return "{\"ok\":true,\"step\":" + json::quote(write_step(valid_solids(result, what))) + "}";
+}
+
 std::string answer(const std::string& line)
 {
   const json::Value request = json::parse(line);
@@ -235,9 +352,11 @@ std::string answer(const std::string& line)
   const std::string op = request["op"].str();
   if (op == "hello")
     return std::string("{\"ok\":true,\"provider\":\"occt\",\"version\":") + json::quote(OCC_VERSION_COMPLETE)
-           + ",\"operations\":[\"boolean\"]}";
+           + ",\"operations\":[\"boolean\",\"fillet\",\"chamfer\"]}";
   if (op == "boolean")
     return boolean(request);
+  if (op == "fillet" || op == "chamfer")
+    return blend(request, op == "fillet");
   throw Failure("unknown request `" + op + "`");
 }
 
@@ -271,6 +390,33 @@ int self_test()
     }
     const bool ok = std::fabs(got - c.volume) <= 1e-6 * c.volume;
     std::cerr << (ok ? "ok   " : "FAIL ") << c.kind << ": volume " << got << " (expected " << c.volume << ")\n";
+    failed += ok ? 0 : 1;
+  }
+  // A 2 mm round and a 2 mm chamfer of the block's top front edge (along X at y = 0, z = 10).
+  const double pi = 3.14159265358979323846;
+  const struct
+  {
+    const char* op;
+    const char* size;
+    double      volume;
+  } blends[] = {{"fillet", "radius", 2000.0 - 20.0 * (4.0 - pi)}, {"chamfer", "distance", 2000.0 - 20.0 * 2.0}};
+  const std::string block = "[" + json::quote(write_step(a)) + "]";
+  for (const auto& c : blends)
+  {
+    const std::string request = std::string("{\"protocol\":\"") + Protocol + "\",\"op\":\"" + c.op + "\",\"" + c.size
+                                + "\":2,\"edges\":[[10,0,10]],\"operands\":" + block + ",\"tolerance_mm\":1e-6}";
+    double got = -1.0;
+    try
+    {
+      const json::Value reply = json::parse(answer(request));
+      got                     = volume_of(read_step(reply["step"].str(), "result"));
+    }
+    catch (const std::exception& e)
+    {
+      std::cerr << c.op << ": " << e.what() << "\n";
+    }
+    const bool ok = std::fabs(got - c.volume) <= 1e-6 * c.volume;
+    std::cerr << (ok ? "ok   " : "FAIL ") << c.op << ": volume " << got << " (expected " << c.volume << ")\n";
     failed += ok ? 0 : 1;
   }
   return failed == 0 ? 0 : 1;
